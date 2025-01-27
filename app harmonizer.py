@@ -4,17 +4,14 @@ import time
 import json
 import base64
 import logging
-import decouple
 import requests
 import pydicom
-import openai
 
 import numpy as np
 
 from PIL import Image
 from flask_cors import CORS
 from flask import Flask, jsonify, request
-
 from langchain_community.llms import Ollama  # LangChain Ollama integration
 
 # Initialize Flask app
@@ -30,116 +27,80 @@ start_time = time.time()
 def home():
     return jsonify({
         "message": "Welcome to the Flask API!",
-        "endpoints": [
-            f"/{API_VERSION}/healthz"
-        ]
+        "endpoints": [f"/{API_VERSION}/healthz", f"/{API_VERSION}/analyze", f"/{API_VERSION}/harmonize"]
     }), 200
 
 @app.route(f"/{API_VERSION}/healthz", methods=["GET"])
 def health():
     uptime = time.time() - start_time
-    response = {"message": "OK", "timestamp": int(time.time()), "uptime": int(uptime)}
-    return jsonify(response), 200
-
+    return jsonify({
+        "message": "OK",
+        "timestamp": int(time.time()),
+        "uptime": int(uptime)
+    }), 200
 
 def analyze_image(file_path_or_bytes):
     try:
-        # If the input is a file path (str), open the file and read it as bytes
-        if isinstance(file_path_or_bytes, str):
-            with open(file_path_or_bytes, "rb") as f:
-                file_bytes = f.read()
-        else:
-            # If the input is already bytes, use it directly
-            file_bytes = file_path_or_bytes
+        # Read file as bytes
+        file_bytes = (
+            open(file_path_or_bytes, "rb").read() if isinstance(file_path_or_bytes, str) else file_path_or_bytes
+        )
 
-        # Wrap the bytes in a file-like object
-        image_buffer = io.BytesIO(file_bytes)
-
-        # Decode the DICOM image
-        ds = pydicom.dcmread(image_buffer)
+        # Decode DICOM image
+        ds = pydicom.dcmread(io.BytesIO(file_bytes))
         image = ds.pixel_array
 
-        # Normalize the image and convert to 8-bit
-        image_8bit = (
-            (image - np.min(image)) / (np.max(image) - np.min(image)) * 255
-        ).astype(np.uint8)
-
-        # Convert the 8-bit array to a PIL image
+        # Normalize and convert to 8-bit
+        image_8bit = ((image - np.min(image)) / (np.max(image) - np.min(image)) * 255).astype(np.uint8)
         pil_image = Image.fromarray(image_8bit)
 
-        # Save the PIL image as JPEG in memory
+        # Encode image to base64
         img_byte_arr = io.BytesIO()
         pil_image.save(img_byte_arr, format="JPEG")
-        img_byte_arr = img_byte_arr.getvalue()
+        encoded_image = base64.b64encode(img_byte_arr.getvalue()).decode("utf-8")
 
-        # Encode the image to base64
-        encoded_image = base64.b64encode(img_byte_arr).decode("utf-8")
-
-        # Define the prompt for Ollama
+        # Define prompt for analysis
         prompt = f"""
         Given the following base64 encoded medical image, determine the following details:
         1. Modality ("CT" or "CR")
         2. Body Part ("Head" or "Chest")
         3. Protocol ("Contrast Enhanced" or "Non Contrast Enhanced")
-        4. Direction ("Lateral" or "Sagittal" or "Axial" or "Coronal")
+        4. Direction ("Lateral", "Sagittal", "Axial", or "Coronal")
         
-        Please provide the result in the following JSON format:
+        Please provide the result in JSON format:
         {{
-            "modality": "CT",  // or "CR" based on visual inspection
-            "body_part": "Head",  // or "Chest" based on anatomical landmarks
-            "protocol": "Contrast Enhanced",  // or "Non Contrast Enhanced" based on presence/absence of contrast agent
-            "direction": "Sagittal"  // or "Axial" or "Coronal" based on the orientation of the image
+            "modality": "CT",
+            "body_part": "Head",
+            "protocol": "Contrast Enhanced",
+            "direction": "Sagittal"
         }}
         Base64 Image:
         data:image/jpeg;base64,{encoded_image}
         """
 
-        # Use LangChain Ollama to generate a response
-        llm = Ollama(model="deepseek-r1:1.5b")  # Specify the local model (e.g., `llama2`)
+        # Use LangChain Ollama
+        llm = Ollama(model="deepseek-r1:1.5b")
         response = llm(prompt)
 
-        # Log the raw response for debugging
-        logging.info(f"Ollama raw response: {response}")
-
-        # Parse the response as JSON
-        try:
-            # Ensure the response is a dictionary before accessing its content
-            if isinstance(response, dict) and "content" in response:
-                response_text = response["content"]
-            else:
-                raise ValueError("Invalid response format: 'content' key missing")
-            
-            # Try to extract JSON from the response text
+        # Extract JSON response
+        if isinstance(response, dict) and "content" in response:
+            response_text = response["content"]
             try:
                 match = re.search(r"```json\n(.*?)\n```", response_text, re.DOTALL)
                 if match:
-                    json_text = match.group(1)
-                    response_data = json.loads(json_text)
-                else:
-                    response_data = json.loads(response_text)
+                    return json.loads(match.group(1))
+                return json.loads(response_text)
             except json.JSONDecodeError:
-                logging.info(
-                    "Using fallback response as the response text could not be parsed as JSON."
-                )
-                response_data = {
-                    "modality": "NA",
-                    "body_part": "NA",
-                    "protocol": "NA",
-                    "direction": "NA",
-                }
-
-        except Exception as e:
-            logging.error(f"Error processing the response from Ollama: {e}")
-            response_data = {
-                "modality": "NA",
-                "body_part": "NA",
-                "protocol": "NA",
-                "direction": "NA",
-            }
-
-        return response_data
+                logging.warning("Failed to parse JSON from response text.")
+        return {
+            "modality": "Unknown",
+            "body_part": "Unknown",
+            "protocol": "Unknown",
+            "direction": "Unknown"
+        }
     except Exception as e:
-        raise ValueError(f"Error processing DICOM image: {e}")
+        logging.error(f"Error in analyze_image: {e}")
+        raise ValueError("Error processing DICOM image")
 
 @app.route(f"/{API_VERSION}/analyze", methods=["POST"])
 def analyze():
@@ -147,12 +108,10 @@ def analyze():
         return jsonify({"error": "No file uploaded"}), 400
 
     file = request.files["file"]
-
-    if file.filename == "":
+    if not file.filename:
         return jsonify({"error": "No file selected"}), 400
 
     try:
-        # Read the DICOM file and process it
         dicom_bytes = file.read()
         result = analyze_image(dicom_bytes)
         return jsonify(result), 200
@@ -160,118 +119,110 @@ def analyze():
         logging.error(f"Error processing DICOM file: {e}")
         return jsonify({"error": str(e)}), 500
 
-
-def send_to_pax(dicom_bytes, target_url=f"http://localhost:5000/{API_VERSION}/pax"):
-    files = {"file": ("modified.dcm", dicom_bytes, "application/dicom")}
-    response = requests.post(target_url, files=files)
-    return response
-
-
 @app.route(f"/{API_VERSION}/harmonize", methods=["POST"])
 def harmonize():
     try:
-        # Receive the file from the request
-        file = request.files["file"]
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
+
         dicom_bytes = file.read()
-        logging.info(f"Received DICOM file of size: {len(dicom_bytes)} bytes")
-
-        # Analyze the image using OpenAI API
         analysis_result = analyze_image(dicom_bytes)
-        logging.info(f"OpenAI analysis result: {analysis_result}")
 
-        # Read the DICOM file from bytes
         ds = pydicom.dcmread(io.BytesIO(dicom_bytes))
-
-        # Modify the headers based on analysis
-        codeLOINC = ""
-        codeMeaning = ""
-        codingSchemaDesignator = "LN"
-        codingSchemaVersion = "2.77"
+        code_loinc, code_meaning = None, None
 
         if analysis_result["body_part"] == "Head":
             if analysis_result["modality"] == "CT":
                 if analysis_result["protocol"] == "Contrast Enhanced":
-                    codeLOINC = "24727-0"
-                    codeMeaning = "Head CT - with contrast"
+                    code_loinc = "24727-0"
+                    code_meaning = "Head CT - with contrast"
                 else:
-                    codeLOINC = "30799-1"
-                    codeMeaning = "Head CT - without contrast"
-            else:
-                logging.error("Invalid modality parameter for head")
-
+                    code_loinc = "30799-1"
+                    code_meaning = "Head CT - without contrast"
         elif analysis_result["body_part"] == "Chest":
             if analysis_result["modality"] == "CT":
                 if analysis_result["protocol"] == "Contrast Enhanced":
-                    codeLOINC = "24628-0"
-                    codeMeaning = "Chest CT - with contrast"
+                    code_loinc = "24628-0"
+                    code_meaning = "Chest CT - with contrast"
                 else:
-                    codeLOINC = "29252-4"
-                    codeMeaning = "Chest CT - without contrast"
-
+                    code_loinc = "29252-4"
+                    code_meaning = "Chest CT - without contrast"
             elif analysis_result["modality"] == "XRAY":
-                if analysis_result["direction"] == "Lateral":
-                    codeLOINC = "39051-8"
-                    codeMeaning = "Chest X-ray - LAT"
-                else:
-                    codeLOINC = "36572-6"
-                    codeMeaning = "Chest X-ray – AP/PA"
-            else:
-                logging.error("Invalid modality parameter for chest")
-        else:
-            logging.error("Unknown body part parameter")
+                code_loinc = "39051-8" if analysis_result["direction"] == "Lateral" else "36572-6"
+                code_meaning = "Chest X-ray - LAT" if analysis_result["direction"] == "Lateral" else "Chest X-ray - AP/PA"
 
-        if not codeLOINC or not codeMeaning:
-            logging.error("Failed to determine LOINC code or meaning")
+        if not code_loinc or not code_meaning:
+            raise ValueError("Unable to determine LOINC code or meaning")
 
-        # Add or update DICOM tags
-        ds.add_new([0x0008, 0x0100], "SH", codeLOINC)
-        ds.add_new([0x0008, 0x0102], "SH", codingSchemaDesignator)
-        ds.add_new([0x0008, 0x0103], "SH", codingSchemaVersion)
-        ds.add_new([0x0008, 0x0104], "LO", codeMeaning)
-        dicom_bytes_modified = io.BytesIO()
-        ds.save_as(dicom_bytes_modified)
-        dicom_bytes_modified.seek(0)
+        ds.add_new([0x0008, 0x0100], "SH", code_loinc)
+        ds.add_new([0x0008, 0x0104], "LO", code_meaning)
+        dicom_modified = io.BytesIO()
+        ds.save_as(dicom_modified)
 
-        # Send the modified DICOM file to another API endpoint if you want
-        # response = send_to_pax(dicom_bytes_modified)
-        # return jsonify({"status": "success", "target_response": response.json()}), 200
-
-        # Return the response from the target API
-        return jsonify({"status": "success", "target_response": analysis_result}), 200
+        return jsonify({"status": "success", "analysis": analysis_result}), 200
 
     except Exception as e:
-        logging.error(f"Error processing DICOM file: {e}")
+        logging.error(f"Error in harmonize: {e}")
         return jsonify({"error": "internal_server_error", "message": str(e)}), 500
-
 
 @app.route(f"/{API_VERSION}/pax", methods=["POST"])
 def pax():
     try:
-        # Mimic receiving the modified DICOM file
-        file = request.files["file"]
+        file = request.files.get("file")
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
+
         dicom_bytes = file.read()
-
-        # For demonstration, just return a success message with some details
         ds = pydicom.dcmread(io.BytesIO(dicom_bytes))
-        response = {
+
+        return jsonify({
             "message": "DICOM file received successfully",
-            "Modality": ds.Modality,
-            # Include other relevant details as needed
-        }
-
-        return jsonify(response), 200
-
+            "Modality": ds.Modality
+        }), 200
     except Exception as e:
-        logging.error(f"Error receiving DICOM file: {e}")
+        logging.error(f"Error in pax: {e}")
         return jsonify({"error": "internal_server_error", "message": str(e)}), 500
-
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    response = {"error": "internal_server_error", "message": str(e)}
-    return jsonify(response), 500
-
+    logging.error(f"Unhandled exception: {e}")
+    return jsonify({"error": "internal_server_error", "message": str(e)}), 500
 
 if __name__ == "__main__":
-    logging.info("Starting the application ...")
     app.run(host="0.0.0.0", port=5000)
+
+import streamlit as st
+import requests
+
+# Streamlit App Title
+st.title("DICOM Image Analyzer")
+
+# File Uploader
+uploaded_file = st.file_uploader("Upload a DICOM file")
+
+if uploaded_file is not None:
+    st.write("File uploaded successfully!")
+
+    # Display the file details
+    st.write(f"Filename: {uploaded_file.name}")
+    st.write(f"File size: {len(uploaded_file.read()) / 1024:.2f} KB")
+    uploaded_file.seek(0)  # Reset file pointer
+
+    # Upload to Flask Backend
+    with st.spinner("Processing the image..."):
+        try:
+            files = {"file": uploaded_file}
+            url = "http://127.0.0.1:5000/v1/analyze"  # Flask backend endpoint
+            response = requests.post(url, files=files)
+
+            if response.status_code == 200:
+                result = response.json()
+                st.success("Image analyzed successfully!")
+                st.json(result)
+            else:
+                st.error("Error analyzing the image.")
+                st.write(response.json())
+        except Exception as e:
+            st.error(f"Error: {e}")
+
