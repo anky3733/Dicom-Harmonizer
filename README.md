@@ -75,12 +75,12 @@ This project provides an end-to-end solution for analyzing DICOM (Digital Imagin
 
 3. Start the Flask backend:
    ```bash
-   python app.py
+   python app_harmonizer.py
    ```
 
 4. Start the Streamlit frontend:
    ```bash
-   streamlit run frontend.py
+   streamlit run streamlit_app.py
    ```
 
 5. Access the web interface at `http://localhost:8501`.
