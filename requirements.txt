@@ -1,0 +1,12 @@
+requests==2.31
+Flask==2.3
+Flask-Cors==4.0
+gunicorn>=21.2
+numpy>=1.23
+pandas>=2.1
+pymongo>=4.5
+python-decouple>=3.8
+marshmallow==3.21.0
+pydicom==2.4.4
+openai==1.30.5
+pillow==10.3.0
